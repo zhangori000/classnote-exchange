@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  min-height: 100vh;
+}
+
+.glass-panel {
+  @apply rounded-2xl border border-white/60 bg-white/80 shadow-lg shadow-ink-900/5 backdrop-blur;
+}
