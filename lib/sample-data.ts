@@ -34,6 +34,16 @@ export type ClassTopic = {
   meetingPattern: string;
   generalPosts: Post[];
   lectureSchedule: LectureEntry[];
+  approval: ApprovalState;
+};
+
+export type ApprovalState = {
+  likes: number;
+  dislikes: number;
+  minConsensusLikes: number;
+  approved: boolean;
+  createdAt: string;
+  expiresAt: string;
 };
 
 export type University = {
@@ -47,6 +57,7 @@ export type University = {
     accent: string;
   };
   classes: ClassTopic[];
+  approval: ApprovalState;
 };
 
 const now = new Date();
@@ -58,6 +69,30 @@ const daysFromNow = (offset: number) =>
 const dayStamp = (offset: number) => daysFromNow(offset).split("T")[0];
 
 const expirationDate = () => daysFromNow(30);
+
+const approvedUniversityApproval = (
+  likes = 120,
+  minConsensusLikes = 30
+): ApprovalState => ({
+  likes,
+  dislikes: 0,
+  minConsensusLikes,
+  approved: true,
+  createdAt: now.toISOString(),
+  expiresAt: expirationDate()
+});
+
+const approvedClassApproval = (
+  likes = 60,
+  minConsensusLikes = 15
+): ApprovalState => ({
+  likes,
+  dislikes: 0,
+  minConsensusLikes,
+  approved: true,
+  createdAt: now.toISOString(),
+  expiresAt: expirationDate()
+});
 
 const comment = (
   id: string,
@@ -273,6 +308,7 @@ export const universities: University[] = [
           { date: dayStamp(4), posts: lecturePosts("neu-phys2371-lecture2", 4) }
         ]
       }
-    ]
+    ].map((cls) => ({ ...cls, approval: approvedClassApproval() })),
+    approval: approvedUniversityApproval()
   }
 ];
