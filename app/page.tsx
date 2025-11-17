@@ -634,11 +634,12 @@ export default function HomePage() {
     ) {
       setRemotePosts((prev) => {
         const posts = prev[remoteMeta.classId] ?? [];
+        const nextPosts: Post[] = posts.map((post) =>
+          post.id === postId ? enforceConsensus(updater(post)) : post
+        );
         return {
           ...prev,
-          [remoteMeta.classId]: posts.map((post) =>
-            post.id === postId ? enforceConsensus(updater(post)) : post
-          )
+          [remoteMeta.classId]: nextPosts
         };
       });
       return;
@@ -1838,14 +1839,20 @@ export default function HomePage() {
                     setRemoteError(result.error ?? "Unable to publish thread.");
                     return;
                   }
+                  const createdPost = result.post;
                   setRemoteError(null);
-                  setRemotePosts((prev) => ({
-                    ...prev,
-                    [selectedClass.id]: [result.post, ...(prev[selectedClass.id] ?? [])]
-                  }));
+                  setRemotePosts((prev) => {
+                    const existing = prev[selectedClass.id] ?? [];
+                    const filtered = existing.filter((post): post is Post => Boolean(post));
+                    const nextPosts: Post[] = [createdPost, ...filtered];
+                    return {
+                      ...prev,
+                      [selectedClass.id]: nextPosts
+                    };
+                  });
                   setRemotePostMeta((prev) => ({
                     ...prev,
-                    [result.post.id]: { classId: selectedClass.id, context: "general" }
+                    [createdPost.id]: { classId: selectedClass.id, context: "general" }
                   }));
                   setNewPostTitle("");
                   setNewPostBody("");
