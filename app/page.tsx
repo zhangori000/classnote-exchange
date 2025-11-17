@@ -36,7 +36,14 @@ import {
 
 import { generateAlias } from "@/lib/random-alias";
 import type { ApprovalState, ClassTopic, LectureEntry, Post, University } from "@/lib/sample-data";
-import { universities as seedUniversities } from "@/lib/sample-data";
+import {
+  createRemoteComment,
+  createRemotePost,
+  fetchRemotePosts,
+  persistPostVote,
+  type RemotePostMeta
+} from "@/lib/remote-posts";
+import { fetchSupabaseCatalog } from "@/lib/supabase-catalog";
 
 type PostContext =
   | { context: "general"; postId: string }
@@ -257,14 +264,18 @@ const pruneExpiredEntities = (universities: University[]) => {
 };
 
 export default function HomePage() {
-  const [catalog, setCatalog] = useState<University[]>(seedUniversities);
+  const [catalog, setCatalog] = useState<University[]>([]);
+  const [remotePosts, setRemotePosts] = useState<Record<string, Post[]>>({});
+  const [remotePostMeta, setRemotePostMeta] = useState<Record<string, RemotePostMeta>>({});
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [isRemoteLoading, setIsRemoteLoading] = useState(true);
+  const [isRemoteMutating, setIsRemoteMutating] = useState(false);
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [isCatalogLoading, setIsCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
-  const [selectedUniversityId, setSelectedUniversityId] = useState(
-    seedUniversities[0]?.id ?? ""
-  );
-  const [selectedClassId, setSelectedClassId] = useState(
-    seedUniversities[0]?.classes[0]?.id ?? ""
-  );
+  const [selectedUniversityId, setSelectedUniversityId] = useState("");
+  const [selectedClassId, setSelectedClassId] = useState("");
   const [activeTab, setActiveTab] = useState<"general" | "lecture">("general");
   const [openTabs, setOpenTabs] = useState<ThreadTab[]>([]);
   const [activeTabKey, setActiveTabKey] = useState<string | null>(null);
@@ -395,12 +406,15 @@ export default function HomePage() {
     (thread: PostContext | null) => {
       if (!thread || !selectedClass) return undefined;
       if (thread.context === "general") {
+        const remoteMatch =
+          remotePosts[selectedClass.id]?.find((post) => post.id === thread.postId);
+        if (remoteMatch) return remoteMatch;
         return selectedClass.generalPosts.find((post) => post.id === thread.postId);
       }
       const lecture = selectedClass.lectureSchedule.find((entry) => entry.date === thread.date);
       return lecture?.posts.find((post) => post.id === thread.postId);
     },
-    [selectedClass]
+    [remotePosts, selectedClass]
   );
 
   const activePost = useMemo(
@@ -427,6 +441,91 @@ export default function HomePage() {
   useEffect(() => {
     setCatalog((prev) => pruneExpiredEntities(prev));
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadCatalog = async () => {
+      try {
+        setIsCatalogLoading(true);
+        const result = await fetchSupabaseCatalog();
+        if (cancelled) return;
+        if (result.error) {
+          setCatalogError(result.error);
+          return;
+        }
+        setCatalog((prev) => {
+          const next = [...prev];
+          const indexLookup = new Map<string, number>();
+          next.forEach((uni, index) => indexLookup.set(uni.id, index));
+          result.universities.forEach((uni) => {
+            if (indexLookup.has(uni.id)) {
+              next[indexLookup.get(uni.id)!] = uni;
+            } else {
+              next.push(uni);
+            }
+          });
+          return next;
+        });
+        setCatalogError(null);
+        if (result.universities.length) {
+          setSelectedUniversityId((current) => {
+            const alreadyPresent = result.universities.some((uni) => uni.id === current);
+            if (alreadyPresent) return current;
+            return result.universities[0]?.id ?? current;
+          });
+        }
+      } finally {
+        if (!cancelled) {
+          setIsCatalogLoading(false);
+        }
+      }
+    };
+    loadCatalog();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storageKey = "classnote-device-id";
+    let id = window.localStorage.getItem(storageKey);
+    if (!id) {
+      id =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      window.localStorage.setItem(storageKey, id);
+    }
+    setDeviceId(id);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadRemotePosts = async () => {
+      try {
+        setIsRemoteLoading(true);
+        const result = await fetchRemotePosts(deviceId ?? undefined);
+        if (cancelled) return;
+        if (result.error) {
+          setRemoteError(result.error);
+        } else {
+          setRemotePosts(result.postsByClass);
+          setRemotePostMeta(result.meta);
+          setVoteHistory((prev) => ({ ...prev, ...result.voteHistory }));
+          setRemoteError(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsRemoteLoading(false);
+        }
+      }
+    };
+    loadRemotePosts();
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceId]);
 
 
   const selectedDayKey = selectedDate ? dayKey(selectedDate) : null;
@@ -527,6 +626,23 @@ export default function HomePage() {
       ...post,
       approved: post.approved || post.likes >= post.minConsensusLikes
     });
+    const remoteMeta = remotePostMeta[postId];
+    if (
+      remoteMeta &&
+      remoteMeta.context === context &&
+      (context !== "lecture" || remoteMeta.lectureDate === lectureDate)
+    ) {
+      setRemotePosts((prev) => {
+        const posts = prev[remoteMeta.classId] ?? [];
+        return {
+          ...prev,
+          [remoteMeta.classId]: posts.map((post) =>
+            post.id === postId ? enforceConsensus(updater(post)) : post
+          )
+        };
+      });
+      return;
+    }
     if (!selectedUniversity || !selectedClass) return;
 
     setCatalog((prev) =>
@@ -570,6 +686,28 @@ export default function HomePage() {
     const previousVote = voteHistory[postId];
     const togglingOff = previousVote === type;
     const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
+    const remoteMeta = remotePostMeta[postId];
+    const remoteMatch =
+      remoteMeta &&
+      remoteMeta.context === context &&
+      (context !== "lecture" || remoteMeta.lectureDate === lectureDate)
+        ? (remotePosts[remoteMeta.classId] ?? []).find((post) => post.id === postId)
+        : undefined;
+    let nextLikes = remoteMatch?.likes ?? 0;
+    let nextDislikes = remoteMatch?.dislikes ?? 0;
+    if (remoteMatch) {
+      if (previousVote === "like") {
+        nextLikes = Math.max(0, nextLikes - 1);
+      } else if (previousVote === "dislike") {
+        nextDislikes = Math.max(0, nextDislikes - 1);
+      }
+
+      if (nextVote === "like") {
+        nextLikes += 1;
+      } else if (nextVote === "dislike") {
+        nextDislikes += 1;
+      }
+    }
 
     setVoteHistory((prev) => {
       const next = { ...prev };
@@ -608,57 +746,79 @@ export default function HomePage() {
       },
       lectureDate
     );
+
+    if (remoteMatch && deviceId) {
+      void persistPostVote({
+        postId,
+        deviceId,
+        previousVote,
+        nextVote,
+        likes: nextLikes,
+        dislikes: nextDislikes,
+        minConsensusLikes: remoteMatch.minConsensusLikes
+      }).then((result) => {
+        if (result.error) {
+          setRemoteError(result.error);
+        } else {
+          setRemoteError(null);
+        }
+      });
+    }
   };
 
   const handleUniversityVote = (universityId: string, type: "like" | "dislike") => {
+    const previousVote = universityVoteHistory[universityId];
+    const togglingOff = previousVote === type;
+    const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
+
     setUniversityVoteHistory((prev) => {
-      const previousVote = prev[universityId];
-      const togglingOff = previousVote === type;
-      const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
       const nextHistory = { ...prev };
       if (togglingOff) {
         delete nextHistory[universityId];
       } else {
         nextHistory[universityId] = type;
       }
-      setCatalog((catalogPrev) =>
-        catalogPrev.map((uni) => {
-          if (uni.id !== universityId || uni.approval.approved) return uni;
-          return {
-            ...uni,
-            approval: applyVoteToApproval(uni.approval, previousVote, nextVote)
-          };
-        })
-      );
       return nextHistory;
     });
+
+    setCatalog((catalogPrev) =>
+      catalogPrev.map((uni) => {
+        if (uni.id !== universityId || uni.approval.approved) return uni;
+        return {
+          ...uni,
+          approval: applyVoteToApproval(uni.approval, previousVote, nextVote)
+        };
+      })
+    );
   };
 
   const handleClassVote = (classId: string, type: "like" | "dislike") => {
+    const previousVote = classVoteHistory[classId];
+    const togglingOff = previousVote === type;
+    const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
+
     setClassVoteHistory((prev) => {
-      const previousVote = prev[classId];
-      const togglingOff = previousVote === type;
-      const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
       const nextHistory = { ...prev };
       if (togglingOff) {
         delete nextHistory[classId];
       } else {
         nextHistory[classId] = type;
       }
-      setCatalog((catalogPrev) =>
-        catalogPrev.map((uni) => ({
-          ...uni,
-          classes: uni.classes.map((cls) => {
-            if (cls.id !== classId || cls.approval.approved) return cls;
-            return {
-              ...cls,
-              approval: applyVoteToApproval(cls.approval, previousVote, nextVote)
-            };
-          })
-        }))
-      );
       return nextHistory;
     });
+
+    setCatalog((catalogPrev) =>
+      catalogPrev.map((uni) => ({
+        ...uni,
+        classes: uni.classes.map((cls) => {
+          if (cls.id !== classId || cls.approval.approved) return cls;
+          return {
+            ...cls,
+            approval: applyVoteToApproval(cls.approval, previousVote, nextVote)
+          };
+        })
+      }))
+    );
   };
 
   const handleAddClass = () => {
@@ -821,74 +981,78 @@ export default function HomePage() {
   }, [applyMergeRequest]);
 
   const handleMergeRequestVote = (requestId: string, type: "like" | "dislike") => {
+    const previousVote = mergeVoteHistory[requestId];
+    const togglingOff = previousVote === type;
+    const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
+
     setMergeVoteHistory((prev) => {
-      const previousVote = prev[requestId];
-      const togglingOff = previousVote === type;
-      const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
       const nextHistory = { ...prev };
       if (togglingOff) {
         delete nextHistory[requestId];
       } else {
         nextHistory[requestId] = type;
       }
-      setMergeRequests((requests) =>
-        requests.map((request) => {
-          if (request.id !== requestId || request.approved) return request;
-          let likes = request.likes;
-          let dislikes = request.dislikes;
-          if (previousVote === "like") likes = Math.max(0, likes - 1);
-          if (previousVote === "dislike") dislikes = Math.max(0, dislikes - 1);
-          if (nextVote === "like") likes += 1;
-          if (nextVote === "dislike") dislikes += 1;
-          return {
-            ...request,
-            likes,
-            dislikes,
-            approved: likes >= request.minConsensusLikes
-          };
-        })
-      );
       return nextHistory;
     });
+
+    setMergeRequests((requests) =>
+      requests.map((request) => {
+        if (request.id !== requestId || request.approved) return request;
+        let likes = request.likes;
+        let dislikes = request.dislikes;
+        if (previousVote === "like") likes = Math.max(0, likes - 1);
+        if (previousVote === "dislike") dislikes = Math.max(0, dislikes - 1);
+        if (nextVote === "like") likes += 1;
+        if (nextVote === "dislike") dislikes += 1;
+        return {
+          ...request,
+          likes,
+          dislikes,
+          approved: likes >= request.minConsensusLikes
+        };
+      })
+    );
   };
 
   const handleFieldChangeVote = (requestId: string, type: "like" | "dislike") => {
+    const previousVote = fieldChangeVoteHistory[requestId];
+    const togglingOff = previousVote === type;
+    const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
+
     setFieldChangeVoteHistory((prev) => {
-      const previousVote = prev[requestId];
-      const togglingOff = previousVote === type;
-      const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
       const nextHistory = { ...prev };
       if (togglingOff) {
         delete nextHistory[requestId];
       } else {
         nextHistory[requestId] = type;
       }
-      setFieldChangeRequests((requests) =>
-        requests.map((request) => {
-          if (request.id !== requestId || request.approved) return request;
-          const approval = applyVoteToApproval(
-            {
-              likes: request.likes,
-              dislikes: request.dislikes,
-              minConsensusLikes: request.minConsensusLikes,
-              approved: request.approved,
-              createdAt: request.createdAt,
-              expiresAt: request.expiresAt
-            },
-            previousVote,
-            nextVote,
-            request.minConsensusLikes
-          );
-          return {
-            ...request,
-            likes: approval.likes,
-            dislikes: approval.dislikes,
-            approved: approval.approved
-          };
-        })
-      );
       return nextHistory;
     });
+
+    setFieldChangeRequests((requests) =>
+      requests.map((request) => {
+        if (request.id !== requestId || request.approved) return request;
+        const approval = applyVoteToApproval(
+          {
+            likes: request.likes,
+            dislikes: request.dislikes,
+            minConsensusLikes: request.minConsensusLikes,
+            approved: request.approved,
+            createdAt: request.createdAt,
+            expiresAt: request.expiresAt
+          },
+          previousVote,
+          nextVote,
+          request.minConsensusLikes
+        );
+        return {
+          ...request,
+          likes: approval.likes,
+          dislikes: approval.dislikes,
+          approved: approval.approved
+        };
+      })
+    );
   };
 
   const handleFieldChangeSubmit = () => {
@@ -1000,16 +1164,22 @@ export default function HomePage() {
     setIsAddUniversityOpen(false);
   };
 
-  const handleCommentSubmit = () => {
+  const handleCommentSubmit = async () => {
     if (!selectedPostRef || !activePost || !commentDraft.trim()) return;
 
+    const content = commentDraft.trim();
     const alias = commentAnon ? anonAlias : "You";
     const newComment = {
       id: createLocalId(),
       author: alias,
       createdAt: new Date().toISOString(),
-      content: commentDraft.trim()
+      content
     };
+    const remoteMeta = remotePostMeta[selectedPostRef.postId];
+    const isRemote =
+      remoteMeta &&
+      remoteMeta.context === selectedPostRef.context &&
+      (selectedPostRef.context !== "lecture" || remoteMeta.lectureDate === selectedPostRef.date);
 
     mutatePost(
       selectedPostRef.context,
@@ -1024,6 +1194,20 @@ export default function HomePage() {
     setCommentDraft("");
     if (commentAnon) {
       setAnonAlias(generateAlias());
+    }
+
+    if (isRemote && deviceId) {
+      const result = await createRemoteComment({
+        postId: selectedPostRef.postId,
+        deviceId,
+        author: alias,
+        content
+      });
+      if (result.error) {
+        setRemoteError(result.error);
+      } else {
+        setRemoteError(null);
+      }
     }
   };
 
@@ -1055,12 +1239,18 @@ export default function HomePage() {
     threadDockRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [activeThreadTab]);
 
+  const generalPosts = useMemo(() => {
+    if (!selectedClass) return [];
+    const remote = remotePosts[selectedClass.id] ?? [];
+    return [...remote, ...selectedClass.generalPosts];
+  }, [remotePosts, selectedClass]);
+
   const sortedGeneralPosts = useMemo(() => {
     if (!selectedClass) return [];
-    return [...selectedClass.generalPosts].sort(
+    return [...generalPosts].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
-  }, [selectedClass]);
+  }, [generalPosts, selectedClass]);
 
   const canSubmitUniversity = Boolean(newUniversityName.trim());
   const selectedUniversityPending = Boolean(selectedUniversity && !selectedUniversity.approval.approved);
@@ -1197,6 +1387,16 @@ export default function HomePage() {
         </div>
       </header>
       <section className="glass-panel mb-6 p-6">
+        {catalogError && (
+          <div className="mb-4 rounded-2xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm text-rose-600">
+            {catalogError}
+          </div>
+        )}
+        {isCatalogLoading && (
+          <div className="mb-4 rounded-2xl border border-dashed border-ink-100 bg-ink-50/60 px-4 py-2 text-xs font-semibold text-ink-500">
+            Syncing campuses from Supabase...
+          </div>
+        )}
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
                 <p className="text-sm font-semibold uppercase tracking-tight text-ink-500">Campus directory</p>
@@ -1614,48 +1814,45 @@ export default function HomePage() {
               </button>
               <button
                 type="button"
-                onClick={() => {
+                onClick={async () => {
                   if (!selectedClass || !selectedUniversity) return;
                   if (!newPostTitle.trim() || !newPostBody.trim()) return;
                   const tags = newPostTags
                     .split(",")
                     .map((tag) => tag.trim())
                     .filter(Boolean);
-                  const newPost: Post = {
-                    id: createLocalId(),
+                  const author = newPostAnon ? generateAlias() : "You";
+                  setIsRemoteMutating(true);
+                  const result = await createRemotePost({
+                    classId: selectedClass.id,
+                    context: "general",
                     title: newPostTitle.trim(),
                     body: newPostBody.trim(),
-                    likes: 0,
-                    dislikes: 0,
                     tags,
-                    author: newPostAnon ? generateAlias() : "You",
-                    createdAt: new Date().toISOString(),
-                    comments: [],
+                    author,
                     minConsensusLikes: 15,
-                    approved: false,
                     expiresAt: defaultExpiration()
-                  };
-                  setCatalog((prev) =>
-                    prev.map((uni) => {
-                      if (uni.id !== selectedUniversity.id) return uni;
-                      return {
-                        ...uni,
-                        classes: uni.classes.map((cls) => {
-                          if (cls.id !== selectedClass.id) return cls;
-                          return {
-                            ...cls,
-                            generalPosts: [newPost, ...cls.generalPosts]
-                          };
-                        })
-                      };
-                    })
-                  );
+                  });
+                  setIsRemoteMutating(false);
+                  if (result.error || !result.post) {
+                    setRemoteError(result.error ?? "Unable to publish thread.");
+                    return;
+                  }
+                  setRemoteError(null);
+                  setRemotePosts((prev) => ({
+                    ...prev,
+                    [selectedClass.id]: [result.post, ...(prev[selectedClass.id] ?? [])]
+                  }));
+                  setRemotePostMeta((prev) => ({
+                    ...prev,
+                    [result.post.id]: { classId: selectedClass.id, context: "general" }
+                  }));
                   setNewPostTitle("");
                   setNewPostBody("");
                   setNewPostTags("");
                   setNewPostAnon(true);
                 }}
-                disabled={!newPostTitle.trim() || !newPostBody.trim()}
+                disabled={!newPostTitle.trim() || !newPostBody.trim() || isRemoteMutating}
                 className="rounded-full bg-ink-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-ink-200"
               >
                 Share thread
@@ -1664,9 +1861,19 @@ export default function HomePage() {
             <p className="text-xs text-ink-500">
               Consensus needs 15 likes (10% of active readers) within 30 days for permanent storage. Threads below the line expire automatically.
             </p>
+            {remoteError && (
+              <p className="rounded-2xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600">
+                {remoteError}
+              </p>
+            )}
           </div>
           {activeTab === "general" && (
             <div className="space-y-4">
+              {(isRemoteLoading || isRemoteMutating) && (
+                <div className="rounded-2xl border border-dashed border-ink-200 bg-white/70 px-4 py-3 text-xs font-semibold text-ink-500">
+                  {isRemoteMutating ? "Saving to Supabase..." : "Loading Supabase threads..."}
+                </div>
+              )}
               {sortedGeneralPosts.map((post) => {
                 const userVote = voteHistory[post.id];
                 const likeActive = userVote === "like";
