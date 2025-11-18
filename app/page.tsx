@@ -1,7 +1,8 @@
-﻿"use client";
+"use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import {
   BookOpen,
   CalendarDays,
@@ -12,6 +13,7 @@ import {
   GitMerge,
   Maximize2,
   MessageCircle,
+  Flag,
   Menu,
   Minimize2,
   Notebook,
@@ -43,7 +45,17 @@ import {
   persistPostVote,
   type RemotePostMeta
 } from "@/lib/remote-posts";
-import { fetchSupabaseCatalog } from "@/lib/supabase-catalog";
+import {
+  fetchSupabaseCatalog,
+  createRemoteClass,
+  createRemoteUniversity
+} from "@/lib/supabase-catalog";
+import {
+  fetchApprovalVotes,
+  persistClassVote,
+  persistUniversityVote
+} from "@/lib/remote-approvals";
+import { getSupabaseBrowserClient } from "@/lib/supabase-browser";
 
 type PostContext =
   | { context: "general"; postId: string }
@@ -116,13 +128,16 @@ const createLocalId = () =>
 
 const dayKey = (date: Date) => format(date, "yyyy-MM-dd");
 
-const UNIVERSITY_CONSENSUS_MIN = 30;
-const CLASS_CONSENSUS_MIN = 20;
+const APPROVAL_RATIO_TARGET = 0.9;
+const APPROVAL_RATIO_PERCENT = Math.round(APPROVAL_RATIO_TARGET * 100);
+const UNIVERSITY_APPROVAL_RATIO = APPROVAL_RATIO_TARGET;
+const CLASS_APPROVAL_RATIO = APPROVAL_RATIO_TARGET;
 const FIELD_CONSENSUS_MIN = 25;
 const UNIVERSITY_PROPOSAL_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MERGE_REQUEST_TTL_MS = 45 * 24 * 60 * 60 * 1000;
 const FIELD_REQUEST_TTL_MS = 21 * 24 * 60 * 60 * 1000;
 const MERGE_CONSENSUS_MIN = 80;
+const REALTIME_DEBOUNCE_MS = 120;
 
 const campusPalettes = [
   { primary: "#0f172a", accent: "#f97316" },
@@ -131,12 +146,6 @@ const campusPalettes = [
   { primary: "#312e81", accent: "#f472b6" },
   { primary: "#065f46", accent: "#f59e0b" }
 ];
-
-const slugify = (value: string) =>
-  value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "");
 
 const normalizeUniversityName = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
 
@@ -177,14 +186,60 @@ const mergeLectureSchedules = (target: LectureEntry[], incoming: LectureEntry[])
   );
 };
 
+const meetsApprovalRatio = (likes: number, dislikes: number, ratioTarget: number) => {
+  const total = likes + dislikes;
+  if (total <= 0) return false;
+  return likes / total >= ratioTarget;
+};
+
+const getApprovalRatioStats = (approval: ApprovalState) => {
+  const totalVotes = approval.likes + approval.dislikes;
+  return {
+    totalVotes,
+    ratioPercent:
+      totalVotes > 0 ? Math.round((approval.likes / totalVotes) * 100) : 0,
+    targetPercent: Math.round(approval.ratioTarget * 100)
+  };
+};
+
+const describeApprovalProgress = (approval: ApprovalState) => {
+  const stats = getApprovalRatioStats(approval);
+  return {
+    ...stats,
+    ratioDescription:
+      stats.totalVotes === 0
+        ? "No votes yet"
+        : `${stats.ratioPercent}% positive (${approval.likes} up · ${approval.dislikes} hold)`
+  };
+};
+
+const approvalRequirementCopy = (approval: ApprovalState) => {
+  const stats = describeApprovalProgress(approval);
+  if (approval.approved) {
+    return `Locked with ${stats.ratioPercent}% positive votes`;
+  }
+  if (stats.totalVotes === 0) {
+    return `Needs ${stats.targetPercent}% positive votes to publish`;
+  }
+  return `${stats.ratioPercent}% positive · need ${stats.targetPercent}% to publish`;
+};
+
+const explainSupabaseError = (message?: string | null) => {
+  if (!message) return "Supabase rejected the request.";
+  if (message.toLowerCase().includes("row-level security")) {
+    return "Supabase row-level security blocked this action. Enable anon insert/update policies for universities/classes.";
+  }
+  return message;
+};
+
 const mergeClassTopic = (target: ClassTopic, incoming: ClassTopic): ClassTopic => {
   const likes = target.approval.likes + incoming.approval.likes;
   const dislikes = target.approval.dislikes + incoming.approval.dislikes;
-  const minConsensusLikes = Math.max(target.approval.minConsensusLikes, incoming.approval.minConsensusLikes);
+  const ratioTarget = Math.max(target.approval.ratioTarget, incoming.approval.ratioTarget);
   const approved =
     target.approval.approved ||
     incoming.approval.approved ||
-    likes >= minConsensusLikes;
+    meetsApprovalRatio(likes, dislikes, ratioTarget);
   const createdAt =
     new Date(target.approval.createdAt).getTime() <= new Date(incoming.approval.createdAt).getTime()
       ? target.approval.createdAt
@@ -201,7 +256,7 @@ const mergeClassTopic = (target: ClassTopic, incoming: ClassTopic): ClassTopic =
     approval: {
       likes,
       dislikes,
-      minConsensusLikes,
+      ratioTarget,
       approved,
       createdAt,
       expiresAt
@@ -222,8 +277,11 @@ const mergeUniversityRecords = (target: University, incoming: University): Unive
 
   const likes = target.approval.likes + incoming.approval.likes;
   const dislikes = target.approval.dislikes + incoming.approval.dislikes;
-  const minConsensusLikes = Math.max(target.approval.minConsensusLikes, incoming.approval.minConsensusLikes);
-  const approved = target.approval.approved || incoming.approval.approved || likes >= minConsensusLikes;
+  const ratioTarget = Math.max(target.approval.ratioTarget, incoming.approval.ratioTarget);
+  const approved =
+    target.approval.approved ||
+    incoming.approval.approved ||
+    meetsApprovalRatio(likes, dislikes, ratioTarget);
   const createdAt =
     new Date(target.approval.createdAt).getTime() <= new Date(incoming.approval.createdAt).getTime()
       ? target.approval.createdAt
@@ -239,7 +297,7 @@ const mergeUniversityRecords = (target: University, incoming: University): Unive
     approval: {
       likes,
       dislikes,
-      minConsensusLikes,
+      ratioTarget,
       approved,
       createdAt,
       expiresAt
@@ -315,6 +373,9 @@ export default function HomePage() {
     Record<string, "like" | "dislike">
   >({});
   const [fieldProposalReason, setFieldProposalReason] = useState("");
+  const [catalogReloadToken, setCatalogReloadToken] = useState(0);
+  const [remotePostsReloadToken, setRemotePostsReloadToken] = useState(0);
+  const [approvalVotesReloadToken, setApprovalVotesReloadToken] = useState(0);
   const [isAddUniversityOpen, setIsAddUniversityOpen] = useState(false);
   const [isAddClassOpen, setIsAddClassOpen] = useState(false);
   const [isMergeModalOpen, setIsMergeModalOpen] = useState(false);
@@ -322,10 +383,73 @@ export default function HomePage() {
   const [fieldProposalField, setFieldProposalField] = useState("location");
   const [fieldProposalValue, setFieldProposalValue] = useState("");
   const threadDockRef = useRef<HTMLDivElement | null>(null);
+  const broadcastChannelRef = useRef<RealtimeChannel | null>(null);
+  const refreshQueueRef = useRef({ catalog: false, remote: false, votes: false });
+  const refreshTimerRef = useRef<number | null>(null);
 
   const clearOpenTabs = useCallback(() => {
     setOpenTabs([]);
     setActiveTabKey(null);
+  }, []);
+
+  const flushRefreshQueue = useCallback(() => {
+    refreshTimerRef.current = null;
+    const snapshot = { ...refreshQueueRef.current };
+    refreshQueueRef.current = { catalog: false, remote: false, votes: false };
+    if (snapshot.catalog) setCatalogReloadToken((token) => token + 1);
+    if (snapshot.remote) setRemotePostsReloadToken((token) => token + 1);
+    if (snapshot.votes) setApprovalVotesReloadToken((token) => token + 1);
+  }, []);
+
+  const enqueueRefresh = useCallback(
+    (type: "catalog" | "remote" | "votes") => {
+      if (typeof window === "undefined") {
+        if (type === "catalog") setCatalogReloadToken((token) => token + 1);
+        if (type === "remote") setRemotePostsReloadToken((token) => token + 1);
+        if (type === "votes") setApprovalVotesReloadToken((token) => token + 1);
+        return;
+      }
+      refreshQueueRef.current[type] = true;
+      if (refreshTimerRef.current !== null) return;
+      refreshTimerRef.current = window.setTimeout(() => {
+        flushRefreshQueue();
+      }, REALTIME_DEBOUNCE_MS);
+    },
+    [flushRefreshQueue]
+  );
+
+  const scheduleCatalogRefresh = useCallback(() => {
+    enqueueRefresh("catalog");
+  }, [enqueueRefresh]);
+
+  const scheduleRemoteRefresh = useCallback(() => {
+    enqueueRefresh("remote");
+  }, [enqueueRefresh]);
+
+  const scheduleApprovalVotesRefresh = useCallback(() => {
+    enqueueRefresh("votes");
+  }, [enqueueRefresh]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+      }
+    };
+  }, []);
+
+  const broadcastUpdate = useCallback((event: "catalog" | "posts" | "votes") => {
+    const channel = broadcastChannelRef.current;
+    if (!channel) return;
+    channel
+      .send({
+        type: "broadcast",
+        event,
+        payload: {}
+      })
+      .catch(() => {
+        // Ignore failures; polling fallback not present, but manual refresh still available.
+      });
   }, []);
 
   const handleActivateTab = useCallback((key: string) => {
@@ -444,9 +568,12 @@ export default function HomePage() {
 
   useEffect(() => {
     let cancelled = false;
+    const initialLoad = catalogReloadToken === 0;
     const loadCatalog = async () => {
       try {
-        setIsCatalogLoading(true);
+        if (initialLoad) {
+          setIsCatalogLoading(true);
+        }
         const result = await fetchSupabaseCatalog();
         if (cancelled) return;
         if (result.error) {
@@ -475,16 +602,16 @@ export default function HomePage() {
           });
         }
       } finally {
-        if (!cancelled) {
+        if (!cancelled && initialLoad) {
           setIsCatalogLoading(false);
         }
       }
     };
-    loadCatalog();
+    void loadCatalog();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [catalogReloadToken]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -502,9 +629,12 @@ export default function HomePage() {
 
   useEffect(() => {
     let cancelled = false;
+    const initialLoad = remotePostsReloadToken === 0;
     const loadRemotePosts = async () => {
       try {
-        setIsRemoteLoading(true);
+        if (initialLoad) {
+          setIsRemoteLoading(true);
+        }
         const result = await fetchRemotePosts(deviceId ?? undefined);
         if (cancelled) return;
         if (result.error) {
@@ -516,17 +646,123 @@ export default function HomePage() {
           setRemoteError(null);
         }
       } finally {
-        if (!cancelled) {
+        if (!cancelled && initialLoad) {
           setIsRemoteLoading(false);
         }
       }
     };
-    loadRemotePosts();
+    void loadRemotePosts();
     return () => {
       cancelled = true;
     };
-  }, [deviceId]);
+  }, [deviceId, remotePostsReloadToken]);
 
+  useEffect(() => {
+    if (!deviceId) return;
+    let cancelled = false;
+    const loadApprovalVotes = async () => {
+      const result = await fetchApprovalVotes(deviceId);
+      if (cancelled) return;
+      if (result.error) {
+        setRemoteError(result.error);
+        return;
+      }
+      setUniversityVoteHistory(result.universityVotes);
+      setClassVoteHistory(result.classVotes);
+    };
+    void loadApprovalVotes();
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceId, approvalVotesReloadToken]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const supabase = getSupabaseBrowserClient();
+    const channel = supabase
+      .channel("catalog-live")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "universities" },
+        () => scheduleCatalogRefresh()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "classes" },
+        () => scheduleCatalogRefresh()
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [scheduleCatalogRefresh]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const supabase = getSupabaseBrowserClient();
+    const channel = supabase
+      .channel("posts-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "posts" }, () =>
+        scheduleRemoteRefresh()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "comments" },
+        () => scheduleRemoteRefresh()
+      );
+    if (deviceId) {
+      channel.on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "post_likes", filter: `device_id=eq.${deviceId}` },
+        () => scheduleRemoteRefresh()
+      );
+    }
+    channel.subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [deviceId, scheduleRemoteRefresh]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !deviceId) return;
+    const supabase = getSupabaseBrowserClient();
+    const channel = supabase
+      .channel(`approval-votes-${deviceId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "university_votes", filter: `device_id=eq.${deviceId}` },
+        () => scheduleApprovalVotesRefresh()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "class_votes", filter: `device_id=eq.${deviceId}` },
+        () => scheduleApprovalVotesRefresh()
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [deviceId, scheduleApprovalVotesRefresh]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const supabase = getSupabaseBrowserClient();
+    const channel = supabase
+      .channel("app-sync", {
+        config: {
+          broadcast: { self: false }
+        }
+      })
+      .on("broadcast", { event: "catalog" }, () => scheduleCatalogRefresh())
+      .on("broadcast", { event: "posts" }, () => scheduleRemoteRefresh())
+      .on("broadcast", { event: "votes" }, () => scheduleApprovalVotesRefresh())
+      .subscribe();
+    broadcastChannelRef.current = channel;
+    return () => {
+      broadcastChannelRef.current = null;
+      void supabase.removeChannel(channel);
+    };
+  }, [scheduleCatalogRefresh, scheduleRemoteRefresh, scheduleApprovalVotesRefresh]);
 
   const selectedDayKey = selectedDate ? dayKey(selectedDate) : null;
 
@@ -762,48 +998,90 @@ export default function HomePage() {
           setRemoteError(result.error);
         } else {
           setRemoteError(null);
+          scheduleRemoteRefresh();
+          broadcastUpdate("posts");
         }
       });
     }
   };
 
   const handleUniversityVote = (universityId: string, type: "like" | "dislike") => {
+    const target = catalog.find((uni) => uni.id === universityId);
+    if (!target) return;
+
     const previousVote = universityVoteHistory[universityId];
     const togglingOff = previousVote === type;
     const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
+    let nextApproval = applyRatioApprovalVote(target.approval, previousVote, nextVote);
+    if (target.approval.approved && !nextApproval.approved) {
+      nextApproval = {
+        ...nextApproval,
+        expiresAt: proposalExpiry()
+      };
+    }
 
     setUniversityVoteHistory((prev) => {
       const nextHistory = { ...prev };
       if (togglingOff) {
         delete nextHistory[universityId];
-      } else {
-        nextHistory[universityId] = type;
+      } else if (nextVote) {
+        nextHistory[universityId] = nextVote;
       }
       return nextHistory;
     });
 
     setCatalog((catalogPrev) =>
       catalogPrev.map((uni) => {
-        if (uni.id !== universityId || uni.approval.approved) return uni;
-        return {
-          ...uni,
-          approval: applyVoteToApproval(uni.approval, previousVote, nextVote)
-        };
+        if (uni.id !== universityId) return uni;
+        return { ...uni, approval: nextApproval };
       })
     );
+
+    if (deviceId) {
+      void persistUniversityVote({
+        universityId,
+        deviceId,
+        previousVote,
+        nextVote,
+        approval: nextApproval
+      }).then((result) => {
+        if (result.error) {
+          setRemoteError(result.error);
+        } else {
+          setRemoteError(null);
+          scheduleCatalogRefresh();
+          broadcastUpdate("catalog");
+        }
+      });
+    } else {
+      scheduleCatalogRefresh();
+      broadcastUpdate("catalog");
+    }
   };
 
   const handleClassVote = (classId: string, type: "like" | "dislike") => {
+    const target = catalog
+      .flatMap((uni) => uni.classes)
+      .find((cls) => cls.id === classId);
+    if (!target) return;
+
     const previousVote = classVoteHistory[classId];
     const togglingOff = previousVote === type;
     const nextVote: "like" | "dislike" | undefined = togglingOff ? undefined : type;
+    let nextApproval = applyRatioApprovalVote(target.approval, previousVote, nextVote);
+    if (target.approval.approved && !nextApproval.approved) {
+      nextApproval = {
+        ...nextApproval,
+        expiresAt: proposalExpiry()
+      };
+    }
 
     setClassVoteHistory((prev) => {
       const nextHistory = { ...prev };
       if (togglingOff) {
         delete nextHistory[classId];
-      } else {
-        nextHistory[classId] = type;
+      } else if (nextVote) {
+        nextHistory[classId] = nextVote;
       }
       return nextHistory;
     });
@@ -811,54 +1089,77 @@ export default function HomePage() {
     setCatalog((catalogPrev) =>
       catalogPrev.map((uni) => ({
         ...uni,
-        classes: uni.classes.map((cls) => {
-          if (cls.id !== classId || cls.approval.approved) return cls;
-          return {
-            ...cls,
-            approval: applyVoteToApproval(cls.approval, previousVote, nextVote)
-          };
-        })
+        classes: uni.classes.map((cls) =>
+          cls.id === classId ? { ...cls, approval: nextApproval } : cls
+        )
       }))
     );
+
+    if (deviceId) {
+      void persistClassVote({
+        classId,
+        deviceId,
+        previousVote,
+        nextVote,
+        approval: nextApproval
+      }).then((result) => {
+        if (result.error) {
+          setRemoteError(result.error);
+        } else {
+          setRemoteError(null);
+          scheduleCatalogRefresh();
+          broadcastUpdate("catalog");
+        }
+      });
+    } else {
+      scheduleCatalogRefresh();
+      broadcastUpdate("catalog");
+    }
   };
 
-  const handleAddClass = () => {
+  const handleAddClass = async () => {
     if (!selectedUniversity || !newClassName.trim() || !newClassCode.trim()) return;
     const name = newClassName.trim();
     const code = newClassCode.trim().toUpperCase();
     const instructor = newClassInstructor.trim() || "Community submitted faculty";
     const summary = newClassSummary.trim() || "New course proposal from the community.";
     const meetingPattern = newClassMeetingPattern.trim() || "See syllabus";
-    const baseId = slugify(`${selectedUniversity.id}-${code}-${name}`) || slugify(Date.now().toString());
-    let classId = baseId;
-    let suffix = 1;
-    while (selectedUniversity.classes.some((cls) => cls.id === classId)) {
-      classId = `${baseId}-${suffix++}`;
-    }
-    const newClass: ClassTopic = {
-      id: classId,
+    const approvalSeed: ClassTopic["approval"] = {
+      likes: 0,
+      dislikes: 0,
+      ratioTarget: CLASS_APPROVAL_RATIO,
+      approved: false,
+      createdAt: new Date().toISOString(),
+      expiresAt: proposalExpiry()
+    };
+    const targetUniversityId = selectedUniversity.id;
+
+    setCatalogError(null);
+    const result = await createRemoteClass({
+      universityId: targetUniversityId,
       name,
       code,
       instructor,
       summary,
       meetingPattern,
-      generalPosts: [],
-      lectureSchedule: [],
-      approval: {
-        likes: 1,
-        dislikes: 0,
-        minConsensusLikes: CLASS_CONSENSUS_MIN,
-        approved: false,
-        createdAt: new Date().toISOString(),
-        expiresAt: proposalExpiry()
-      }
-    };
+      approval: approvalSeed
+    });
+
+    if (!result.classTopic || result.error) {
+      setCatalogError(explainSupabaseError(result.error));
+      return;
+    }
+
+    const createdClass = result.classTopic;
     setCatalog((prev) =>
       prev.map((uni) => {
-        if (uni.id !== selectedUniversity.id) return uni;
+        if (uni.id !== targetUniversityId) return uni;
+        const exists = uni.classes.some((cls) => cls.id === createdClass.id);
         return {
           ...uni,
-          classes: [...uni.classes, newClass]
+          classes: exists
+            ? uni.classes.map((cls) => (cls.id === createdClass.id ? createdClass : cls))
+            : [...uni.classes, createdClass]
         };
       })
     );
@@ -867,9 +1168,11 @@ export default function HomePage() {
     setNewClassInstructor("");
     setNewClassSummary("");
     setNewClassMeetingPattern("");
-    setSelectedClassId(newClass.id);
+    setSelectedClassId(createdClass.id);
     clearOpenTabs();
     setIsAddClassOpen(false);
+    scheduleCatalogRefresh();
+    broadcastUpdate("catalog");
   };
 
   const handleCreateMergeRequest = () => {
@@ -1033,7 +1336,7 @@ export default function HomePage() {
     setFieldChangeRequests((requests) =>
       requests.map((request) => {
         if (request.id !== requestId || request.approved) return request;
-        const approval = applyVoteToApproval(
+        const approval = applyCountApprovalVote(
           {
             likes: request.likes,
             dislikes: request.dislikes,
@@ -1113,7 +1416,7 @@ export default function HomePage() {
     });
   }, [applyFieldChangeRequest]);
 
-  const handleAddUniversity = () => {
+  const handleAddUniversity = async () => {
     const name = newUniversityName.trim();
     const location = newUniversityLocation.trim();
     if (!name) return;
@@ -1128,41 +1431,50 @@ export default function HomePage() {
       "CAMP";
     const motto = newUniversityMotto.trim() || "Community submitted campus";
     const palette = pickCampusPalette();
-    const baseId = slugify(`${code}-${name}`) || slugify(name) || `campus-${Date.now()}`;
-    let candidateId = baseId;
-    let suffix = 1;
-    while (catalog.some((uni) => uni.id === candidateId)) {
-      candidateId = `${baseId}-${suffix++}`;
-    }
+    const approvalSeed: University["approval"] = {
+      likes: 0,
+      dislikes: 0,
+      ratioTarget: UNIVERSITY_APPROVAL_RATIO,
+      approved: false,
+      createdAt: new Date().toISOString(),
+      expiresAt: proposalExpiry()
+    };
 
-    const newUniversity: University = {
-      id: candidateId,
+    setCatalogError(null);
+    const result = await createRemoteUniversity({
       name,
       location,
       code,
       motto,
       colors: palette,
-      classes: [],
-      approval: {
-        likes: 1,
-        dislikes: 0,
-        minConsensusLikes: UNIVERSITY_CONSENSUS_MIN,
-        approved: false,
-        createdAt: new Date().toISOString(),
-        expiresAt: proposalExpiry()
-      }
-    };
+      approval: approvalSeed
+    });
 
-    setCatalog((prev) => [...prev, newUniversity]);
+    if (!result.university || result.error) {
+      setCatalogError(explainSupabaseError(result.error));
+      return;
+    }
+
+    const createdUniversity = result.university;
+
+    setCatalog((prev) => {
+      const exists = prev.some((uni) => uni.id === createdUniversity.id);
+      if (exists) {
+        return prev.map((uni) => (uni.id === createdUniversity.id ? createdUniversity : uni));
+      }
+      return [...prev, createdUniversity];
+    });
     setNewUniversityName("");
     setNewUniversityLocation("");
     setNewUniversityCode("");
     setNewUniversityMotto("");
-    setSelectedUniversityId(newUniversity.id);
+    setSelectedUniversityId(createdUniversity.id);
     setSelectedClassId("");
     setActiveTab("general");
     clearOpenTabs();
     setIsAddUniversityOpen(false);
+    scheduleCatalogRefresh();
+    broadcastUpdate("catalog");
   };
 
   const handleCommentSubmit = async () => {
@@ -1208,6 +1520,8 @@ export default function HomePage() {
         setRemoteError(result.error);
       } else {
         setRemoteError(null);
+        scheduleRemoteRefresh();
+        broadcastUpdate("posts");
       }
     }
   };
@@ -1255,18 +1569,15 @@ export default function HomePage() {
 
   const canSubmitUniversity = Boolean(newUniversityName.trim());
   const selectedUniversityPending = Boolean(selectedUniversity && !selectedUniversity.approval.approved);
-  const pendingUniversityMeta = selectedUniversityPending
-    ? {
-        remainingLikes: Math.max(
-          (selectedUniversity?.approval.minConsensusLikes ?? 0) -
-            (selectedUniversity?.approval.likes ?? 0),
-          0
-        ),
-        expiresLabel: selectedUniversity
-          ? formatDistanceToNow(new Date(selectedUniversity.approval.expiresAt), { addSuffix: true })
-          : ""
-      }
-    : null;
+  const pendingUniversityMeta =
+    selectedUniversityPending && selectedUniversity
+      ? {
+          ...describeApprovalProgress(selectedUniversity.approval),
+          expiresLabel: formatDistanceToNow(new Date(selectedUniversity.approval.expiresAt), {
+            addSuffix: true
+          })
+        }
+      : null;
   const canSubmitClass =
     Boolean(newClassName.trim()) &&
     Boolean(newClassCode.trim()) &&
@@ -1379,6 +1690,9 @@ export default function HomePage() {
             <p className="mt-3 max-w-2xl text-lg text-white/80">
               Pick your campus, open the class board, and swap the best lecture notes or exam prep tips without worrying about paywalls or logins.
             </p>
+            <p className="mt-2 max-w-2xl text-sm text-white/70">
+              Campuses and classes only go live when at least {APPROVAL_RATIO_PERCENT}% of votes are positive. Holds count as downvotes, so the crowd can veto bad info.
+            </p>
           </div>
           <div className="glass-panel w-full max-w-sm bg-white/10 p-6 text-white">
             <p className="text-sm font-medium uppercase tracking-wide text-white/80">Zero friction</p>
@@ -1436,7 +1750,7 @@ export default function HomePage() {
             filteredUniversities.map((uni) => {
               const isActive = uni.id === selectedUniversity?.id;
               const pending = !uni.approval.approved;
-              const remainingApprovals = Math.max(uni.approval.minConsensusLikes - uni.approval.likes, 0);
+              const approvalProgress = describeApprovalProgress(uni.approval);
               const expiresLabel = formatDistanceToNow(new Date(uni.approval.expiresAt), { addSuffix: true });
               const uniVote = universityVoteHistory[uni.id];
               const voteButtonClasses = (activeState: boolean) =>
@@ -1494,42 +1808,49 @@ export default function HomePage() {
                       {pending ? `Expires ${expiresLabel}` : "Live"}
                     </span>
                   </div>
-                  {pending && (
-                    <div className="mt-2">
-                      <p
-                        className={clsx(
-                          "text-xs font-semibold",
-                          isActive ? "text-white/80" : "text-ink-700"
-                        )}
+                  <div
+                    className={clsx(
+                      "mt-2 rounded-2xl border px-3 py-2 text-xs",
+                      pending
+                        ? isActive
+                          ? "border-white/40 bg-white/10 text-white"
+                          : "border-amber-100 bg-amber-50 text-amber-800"
+                        : isActive
+                        ? "border-emerald-200 bg-white/10 text-white"
+                        : "border-emerald-100 bg-emerald-50 text-emerald-800"
+                    )}
+                  >
+                    <p className="font-semibold">{approvalRequirementCopy(uni.approval)}</p>
+                    <p className="mt-0.5 text-[11px]">
+                      Current pulse: {approvalProgress.ratioDescription}
+                    </p>
+                    <div className="mt-2 flex gap-2">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleUniversityVote(uni.id, "like");
+                        }}
+                        aria-pressed={uniVote === "like"}
+                        className={voteButtonClasses(uniVote === "like")}
                       >
-                        {remainingApprovals > 0 ? `${remainingApprovals} more approvals needed` : "Ready to approve"}
-                      </p>
-                      <div className="mt-2 flex gap-2">
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            handleUniversityVote(uni.id, "like");
-                          }}
-                          aria-pressed={uniVote === "like"}
-                          className={voteButtonClasses(uniVote === "like")}
-                        >
-                          Approve · {uni.approval.likes}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            handleUniversityVote(uni.id, "dislike");
-                          }}
-                          aria-pressed={uniVote === "dislike"}
-                          className={voteButtonClasses(uniVote === "dislike")}
-                        >
-                          Flag · {uni.approval.dislikes}
-                        </button>
-                      </div>
+                        <ThumbsUp className="h-3.5 w-3.5" />
+                        <span>{uni.approval.likes}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleUniversityVote(uni.id, "dislike");
+                        }}
+                        aria-pressed={uniVote === "dislike"}
+                        className={voteButtonClasses(uniVote === "dislike")}
+                      >
+                        <Flag className="h-3.5 w-3.5" />
+                        <span>{uni.approval.dislikes}</span>
+                      </button>
                     </div>
-                  )}
+                  </div>
                 </div>
               );
             })
@@ -1549,10 +1870,10 @@ export default function HomePage() {
                 const sourceLabel = isUniversity
                   ? universityLookup.get(request.sourceId)?.name ?? "Unknown campus"
                   : (() => {
-                      const info = classLookup.get(request.sourceId);
-                      if (!info) return "Unknown course";
-                      return `${info.cls.code} — ${info.cls.name}`;
-                    })();
+                    const info = classLookup.get(request.sourceId);
+                    if (!info) return "Unknown course";
+                    return `${info.cls.code} — ${info.cls.name}`;
+                  })();
                 const targetLabel = isUniversity
                   ? universityLookup.get(request.targetId)?.name ?? "Unknown campus"
                   : (() => {
@@ -1570,7 +1891,7 @@ export default function HomePage() {
                     className="rounded-2xl border border-ink-100 bg-white/70 p-3 text-sm text-ink-700"
                   >
                     <p className="font-semibold">
-                      Merge {sourceLabel} → {targetLabel}
+                      Merge {sourceLabel} ? {targetLabel}
                     </p>
                     {targetCampus && (
                       <p className="text-xs text-ink-500">{targetCampus}</p>
@@ -1624,7 +1945,7 @@ export default function HomePage() {
                 const isActive = cls.id === selectedClass?.id;
                 const pending = !cls.approval.approved;
                 const classVote = classVoteHistory[cls.id];
-                const remainingApprovals = Math.max(cls.approval.minConsensusLikes - cls.approval.likes, 0);
+                const classApproval = describeApprovalProgress(cls.approval);
                 return (
                   <div
                     key={cls.id}
@@ -1651,45 +1972,55 @@ export default function HomePage() {
                     </button>
                     <p className="mt-2 text-sm font-semibold text-ink-900">{cls.name}</p>
                     <p className="text-xs text-ink-500">{cls.instructor}</p>
-                    {pending ? (
-                      <div className="mt-3 rounded-2xl border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                        <p className="font-semibold">
-                          Needs {remainingApprovals} approvals · {cls.approval.likes} votes so far
-                        </p>
-                        <div className="mt-2 flex gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleClassVote(cls.id, "like")}
-                            aria-pressed={classVote === "like"}
-                            className={clsx(
-                              "flex-1 rounded-full border px-2 py-1 text-[11px] font-semibold transition",
-                              classVote === "like"
-                                ? "border-amber-500 bg-white text-amber-900"
-                                : "border-amber-300 text-amber-800 hover:border-amber-500"
-                            )}
-                          >
-                            Approve · {cls.approval.likes}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleClassVote(cls.id, "dislike")}
-                            aria-pressed={classVote === "dislike"}
-                            className={clsx(
-                              "flex-1 rounded-full border px-2 py-1 text-[11px] font-semibold transition",
-                              classVote === "dislike"
-                                ? "border-rose-500 bg-white text-rose-900"
-                                : "border-rose-200 text-rose-700 hover:border-rose-500"
-                            )}
-                          >
-                            Flag · {cls.approval.dislikes}
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-emerald-600">
-                        Consensus reached
+                      <div
+                        className={clsx(
+                          "mt-3 rounded-2xl border px-3 py-2 text-xs",
+                          pending
+                            ? "border-amber-100 bg-amber-50 text-amber-800"
+                          : "border-emerald-100 bg-emerald-50 text-emerald-800"
+                      )}
+                    >
+                      <p className="font-semibold">
+                        {approvalRequirementCopy(cls.approval)}
                       </p>
-                    )}
+                      <p className="mt-0.5 text-[11px]">
+                        Current pulse: {classApproval.ratioDescription}
+                      </p>
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleClassVote(cls.id, "like")}
+                          aria-pressed={classVote === "like"}
+                          className={clsx(
+                            "flex-1 rounded-full border px-2 py-1 text-[11px] font-semibold transition",
+                            classVote === "like"
+                              ? pending
+                                ? "border-amber-500 bg-white text-amber-900"
+                                : "border-emerald-500 bg-white text-emerald-900"
+                              : pending
+                              ? "border-amber-300 text-amber-800 hover:border-amber-500"
+                              : "border-emerald-300 text-emerald-800 hover:border-emerald-500"
+                          )}
+                        >
+                          <ThumbsUp className="h-3 w-3" />
+                          <span>{cls.approval.likes}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleClassVote(cls.id, "dislike")}
+                          aria-pressed={classVote === "dislike"}
+                          className={clsx(
+                            "flex-1 rounded-full border px-2 py-1 text-[11px] font-semibold transition",
+                            classVote === "dislike"
+                              ? "border-rose-500 bg-white text-rose-900"
+                              : "border-rose-200 text-rose-700 hover:border-rose-500"
+                          )}
+                        >
+                          <ThumbsDown className="h-3 w-3" />
+                          <span>{cls.approval.dislikes}</span>
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 );
               })}
@@ -1747,8 +2078,8 @@ export default function HomePage() {
               <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
                 <p className="font-semibold">Campus proposal pending</p>
                 <p>
-                  Needs {pendingUniversityMeta.remainingLikes} more approvals · Expires{" "}
-                  {pendingUniversityMeta.expiresLabel}
+                  Needs {pendingUniversityMeta.targetPercent}% positive votes (current:{" "}
+                  {pendingUniversityMeta.ratioDescription}) · Expires {pendingUniversityMeta.expiresLabel}
                 </p>
               </div>
             )}
@@ -1858,6 +2189,8 @@ export default function HomePage() {
                   setNewPostBody("");
                   setNewPostTags("");
                   setNewPostAnon(true);
+                  scheduleRemoteRefresh();
+                  broadcastUpdate("posts");
                 }}
                 disabled={!newPostTitle.trim() || !newPostBody.trim() || isRemoteMutating}
                 className="rounded-full bg-ink-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-ink-200"
@@ -2347,7 +2680,7 @@ export default function HomePage() {
               <div>
                 <p className="text-sm font-semibold text-ink-800">Submit a campus</p>
                 <p className="text-xs text-ink-500">
-                  Needs {UNIVERSITY_CONSENSUS_MIN} approvals within 30 days.
+                  Needs {APPROVAL_RATIO_PERCENT}% positive votes within 30 days.
                 </p>
               </div>
               <button
@@ -2405,7 +2738,7 @@ export default function HomePage() {
               <div>
                 <p className="text-sm font-semibold text-ink-800">Add a course for {selectedUniversity.name}</p>
                 <p className="text-xs text-ink-500">
-                  Needs {CLASS_CONSENSUS_MIN} approvals before expiring.
+                  Needs {APPROVAL_RATIO_PERCENT}% positive votes before expiring.
                 </p>
               </div>
               <button
@@ -2598,7 +2931,7 @@ export default function HomePage() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm font-semibold text-ink-800">
-                  Campus updates · {selectedUniversity.name}
+                  Campus updates — {selectedUniversity.name}
                 </p>
                 <p className="text-xs text-ink-500">
                   Each change needs {FIELD_CONSENSUS_MIN} approvals.
@@ -2706,8 +3039,44 @@ export default function HomePage() {
     </main>
   );
 }
-const applyVoteToApproval = (
+type CountApprovalState = {
+  likes: number;
+  dislikes: number;
+  minConsensusLikes: number;
+  approved: boolean;
+  createdAt: string;
+  expiresAt: string;
+};
+
+const applyRatioApprovalVote = (
   approval: ApprovalState,
+  previousVote: "like" | "dislike" | undefined,
+  nextVote: "like" | "dislike" | undefined,
+  ratioOverride?: number
+) => {
+  let likes = approval.likes;
+  let dislikes = approval.dislikes;
+
+  if (previousVote === "like") likes = Math.max(0, likes - 1);
+  if (previousVote === "dislike") dislikes = Math.max(0, dislikes - 1);
+  if (nextVote === "like") likes += 1;
+  if (nextVote === "dislike") dislikes += 1;
+
+  const ratioTarget = ratioOverride ?? approval.ratioTarget;
+
+  const meets = meetsApprovalRatio(likes, dislikes, ratioTarget);
+
+  return {
+    ...approval,
+    likes,
+    dislikes,
+    ratioTarget,
+    approved: meets
+  };
+};
+
+const applyCountApprovalVote = (
+  approval: CountApprovalState,
   previousVote: "like" | "dislike" | undefined,
   nextVote: "like" | "dislike" | undefined,
   minOverride?: number
@@ -2730,3 +3099,4 @@ const applyVoteToApproval = (
     approved: approval.approved || likes >= minConsensus
   };
 };
+

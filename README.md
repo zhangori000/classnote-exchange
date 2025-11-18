@@ -64,6 +64,44 @@ The UI now syncs general threads + comments through Supabase. Make sure your pro
    alter table post_likes
      add column if not exists vote text check (vote in ('like','dislike')) default 'like';
    ```
-4. The `comments` table from the schema summary already matches what the app expects (`post_id`, `device_id`, `author`, `content`, `created_at`).
+4. Track consensus snapshots on each row so reads are cheap (the app updates these columns after every vote):
+   ```sql
+   alter table universities
+     add column if not exists approval_likes integer default 0 not null,
+     add column if not exists approval_dislikes integer default 0 not null,
+     add column if not exists approval_min_consensus integer default 30 not null,
+     add column if not exists approval_approved boolean default false not null,
+     add column if not exists approval_created_at timestamptz default now(),
+     add column if not exists approval_expires_at timestamptz default now() + interval '30 days';
+
+   alter table classes
+     add column if not exists approval_likes integer default 0 not null,
+     add column if not exists approval_dislikes integer default 0 not null,
+     add column if not exists approval_min_consensus integer default 15 not null,
+     add column if not exists approval_approved boolean default false not null,
+     add column if not exists approval_created_at timestamptz default now(),
+     add column if not exists approval_expires_at timestamptz default now() + interval '30 days';
+   ```
+5. Create vote tables so each device can only approve/hold once:
+   ```sql
+   create table if not exists university_votes (
+     id uuid primary key default gen_random_uuid(),
+     university_id uuid not null references universities(id) on delete cascade,
+     device_id text not null,
+     vote text not null default 'like' check (vote in ('like','dislike')),
+     created_at timestamptz default now(),
+     unique (university_id, device_id)
+   );
+
+   create table if not exists class_votes (
+     id uuid primary key default gen_random_uuid(),
+     class_id uuid not null references classes(id) on delete cascade,
+     device_id text not null,
+     vote text not null default 'like' check (vote in ('like','dislike')),
+     created_at timestamptz default now(),
+     unique (class_id, device_id)
+   );
+   ```
+6. The `comments` table from the schema summary already matches what the app expects (`post_id`, `device_id`, `author`, `content`, `created_at`).
 
 With RLS enabled, add policies that allow anonymous `select/insert/update/delete` for these tables or disable RLS while testing. Once the rows exist, the app loads all Supabase posts first, then falls back to the in-memory seed data so LinkedIn visitors always see something.

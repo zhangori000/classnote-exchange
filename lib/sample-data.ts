@@ -40,7 +40,7 @@ export type ClassTopic = {
 export type ApprovalState = {
   likes: number;
   dislikes: number;
-  minConsensusLikes: number;
+  ratioTarget: number;
   approved: boolean;
   createdAt: string;
   expiresAt: string;
@@ -70,13 +70,15 @@ const dayStamp = (offset: number) => daysFromNow(offset).split("T")[0];
 
 const expirationDate = () => daysFromNow(30);
 
+const APPROVAL_RATIO_TARGET = 0.9;
+
 const approvedUniversityApproval = (
   likes = 120,
-  minConsensusLikes = 30
+  ratioTarget = APPROVAL_RATIO_TARGET
 ): ApprovalState => ({
   likes,
   dislikes: 0,
-  minConsensusLikes,
+  ratioTarget,
   approved: true,
   createdAt: now.toISOString(),
   expiresAt: expirationDate()
@@ -84,11 +86,11 @@ const approvedUniversityApproval = (
 
 const approvedClassApproval = (
   likes = 60,
-  minConsensusLikes = 15
+  ratioTarget = APPROVAL_RATIO_TARGET
 ): ApprovalState => ({
   likes,
   dislikes: 0,
-  minConsensusLikes,
+  ratioTarget,
   approved: true,
   createdAt: now.toISOString(),
   expiresAt: expirationDate()
