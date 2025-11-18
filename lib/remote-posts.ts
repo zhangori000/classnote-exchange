@@ -9,6 +9,7 @@ export type RemotePostMeta = {
   classId: string;
   context: "general" | "lecture";
   lectureDate?: string | null;
+  post: Post;
 };
 
 type CommentRow = {
@@ -124,13 +125,24 @@ export const fetchRemotePosts = async (
     (data ?? []).forEach((row) => {
       if (!row.class_id) return;
       const post = mapPost(row);
+      const context: "general" | "lecture" =
+        row.context === "lecture" ? "lecture" : "general";
       meta[row.id] = {
         classId: row.class_id,
-        context: row.context === "lecture" ? "lecture" : "general",
-        lectureDate: row.lecture_date
+        context,
+        lectureDate: row.lecture_date,
+        post
       };
 
-      if (row.context === "lecture") {
+      if (context === "lecture") {
+        if (deviceId && row.votes) {
+          const existingVote = row.votes.find(
+            (vote) => vote.device_id === deviceId
+          );
+          if (existingVote) {
+            voteHistory[row.id] = existingVote.vote;
+          }
+        }
         return;
       }
 

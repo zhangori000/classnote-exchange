@@ -14,7 +14,6 @@ import {
   Maximize2,
   MessageCircle,
   Flag,
-  Menu,
   Minimize2,
   Notebook,
   Search,
@@ -343,6 +342,7 @@ export default function HomePage() {
   const [currentMonth, setCurrentMonth] = useState(startOfMonth(new Date()));
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [mobileLectureListOpen, setMobileLectureListOpen] = useState(false);
+  const [isLectureFilterOpen, setIsLectureFilterOpen] = useState(false);
   const [newPostTitle, setNewPostTitle] = useState("");
   const [newPostBody, setNewPostBody] = useState("");
   const [newPostTags, setNewPostTags] = useState("");
@@ -535,10 +535,19 @@ export default function HomePage() {
         if (remoteMatch) return remoteMatch;
         return selectedClass.generalPosts.find((post) => post.id === thread.postId);
       }
+      const remoteLecture = remotePostMeta[thread.postId];
+      if (
+        remoteLecture &&
+        remoteLecture.context === "lecture" &&
+        remoteLecture.classId === selectedClass.id &&
+        remoteLecture.lectureDate === thread.date
+      ) {
+        return remoteLecture.post;
+      }
       const lecture = selectedClass.lectureSchedule.find((entry) => entry.date === thread.date);
       return lecture?.posts.find((post) => post.id === thread.postId);
     },
-    [remotePosts, selectedClass]
+    [remotePosts, remotePostMeta, selectedClass]
   );
 
   const activePost = useMemo(
@@ -843,14 +852,19 @@ export default function HomePage() {
   useEffect(() => {
     if (!lectureSchedule.length) {
       setSelectedDate(null);
+      setCurrentMonth(startOfMonth(new Date()));
       setMobileLectureListOpen(false);
       return;
     }
-    const firstLectureDate = parseISO(lectureSchedule[0].date);
-    setSelectedDate(firstLectureDate);
-    setCurrentMonth(startOfMonth(firstLectureDate));
+    if (selectedDate) {
+      const key = dayKey(selectedDate);
+      const stillExists = lectureSchedule.some((entry) => entry.date === key);
+      if (!stillExists) {
+        setSelectedDate(null);
+      }
+    }
     setMobileLectureListOpen(false);
-  }, [lectureSchedule]);
+  }, [lectureSchedule, selectedDate]);
 
   const mutatePost = (
     context: PostContext["context"],
@@ -1533,16 +1547,45 @@ export default function HomePage() {
   }, [currentMonth]);
 
   const notesByDay = useMemo(() => {
-    if (!selectedClass) return new Map<string, Post[]>();
-    return new Map(
-      selectedClass.lectureSchedule.map((entry) => [entry.date, entry.posts])
-    );
-  }, [selectedClass]);
+    const map = new Map<string, Post[]>();
+    if (!selectedClass) return map;
+    selectedClass.lectureSchedule.forEach((entry) => {
+      map.set(entry.date, entry.posts);
+    });
+    Object.values(remotePostMeta).forEach((metaEntry) => {
+      if (
+        metaEntry.context === "lecture" &&
+        metaEntry.classId === selectedClass.id &&
+        metaEntry.lectureDate &&
+        metaEntry.post
+      ) {
+        const existing = map.get(metaEntry.lectureDate) ?? [];
+        map.set(metaEntry.lectureDate, [...existing, metaEntry.post]);
+      }
+    });
+    return map;
+  }, [selectedClass, remotePostMeta]);
 
-  const postsForSelectedDay = useMemo(() => {
+  const postsForFilterDate = useMemo(() => {
     if (!selectedDate) return [];
     const key = dayKey(selectedDate);
     return notesByDay.get(key) ?? [];
+  }, [notesByDay, selectedDate]);
+
+  const lectureFeed = useMemo(() => {
+    const entries: Array<{ date: string; post: Post }> = [];
+    notesByDay.forEach((posts, date) => {
+      posts.forEach((post) => {
+        entries.push({ date, post });
+      });
+    });
+    if (selectedDate) {
+      const key = dayKey(selectedDate);
+      return entries.filter((entry) => entry.date === key);
+    }
+    return entries.sort(
+      (a, b) => new Date(b.post.createdAt).getTime() - new Date(a.post.createdAt).getTime()
+    );
   }, [notesByDay, selectedDate]);
 
   useEffect(() => {
@@ -1592,7 +1635,7 @@ export default function HomePage() {
             mergeClassSourceId !== mergeClassTargetId
         );
 
-  const lectureCards = postsForSelectedDay.map((post) => {
+  const lectureCards = lectureFeed.map(({ date, post }) => {
     const userVote = voteHistory[post.id];
     const likeActive = userVote === "like";
     const dislikeActive = userVote === "dislike";
@@ -1607,14 +1650,13 @@ export default function HomePage() {
             : ""
         )}
         onClick={() => {
-          if (!selectedDayKey) return;
-          handleOpenThread({ context: "lecture", postId: post.id, date: selectedDayKey });
+          handleOpenThread({ context: "lecture", postId: post.id, date });
         }}
       >
         <div className="flex items-center justify-between text-xs uppercase tracking-wide text-ink-400">
           <div className="flex items-center gap-2">
             <CalendarDays className="h-4 w-4" />
-            {selectedDate ? `${format(selectedDate, "MMM d")} - Lecture drop` : "Lecture drop"}
+            {`${format(parseISO(date), "MMM d")} · Lecture drop`}
           </div>
           <div className="flex flex-wrap gap-1">
             {post.tags.map((tag) => (
@@ -1647,8 +1689,7 @@ export default function HomePage() {
             )}
             onClick={(event) => {
               event.stopPropagation();
-              if (!selectedDayKey) return;
-              handleVote("lecture", post.id, "like", selectedDayKey);
+              handleVote("lecture", post.id, "like", date);
             }}
             aria-pressed={likeActive}
           >
@@ -1664,8 +1705,7 @@ export default function HomePage() {
             )}
             onClick={(event) => {
               event.stopPropagation();
-              if (!selectedDayKey) return;
-              handleVote("lecture", post.id, "dislike", selectedDayKey);
+              handleVote("lecture", post.id, "dislike", date);
             }}
             aria-pressed={dislikeActive}
           >
@@ -1680,6 +1720,21 @@ export default function HomePage() {
       </article>
     );
   });
+
+  const lectureFilterActive = Boolean(selectedDate);
+  const lectureCount = lectureFeed.length;
+  const lectureSummaryLabel = lectureFilterActive
+    ? selectedDate
+      ? lectureCount
+        ? `${lectureCount} lecture note${lectureCount === 1 ? "" : "s"} on ${format(
+            selectedDate,
+            "MMM d"
+          )}`
+        : `No uploads on ${format(selectedDate, "MMM d")}`
+      : "Select a date to filter lecture notes"
+    : lectureCount
+    ? `${lectureCount} lecture note${lectureCount === 1 ? "" : "s"}`
+    : "No lecture notes yet";
   return (
     <main className="mx-auto max-w-7xl px-4 pt-8 pb-48 lg:px-8">
       <header className="mb-10 rounded-3xl bg-gradient-to-r from-ink-900 to-ink-700 p-10 text-white shadow-xl">
@@ -2183,7 +2238,12 @@ export default function HomePage() {
                   });
                   setRemotePostMeta((prev) => ({
                     ...prev,
-                    [createdPost.id]: { classId: selectedClass.id, context: "general" }
+                    [createdPost.id]: {
+                      classId: selectedClass.id,
+                      context: "general",
+                      lectureDate: null,
+                      post: createdPost
+                    }
                   }));
                   setNewPostTitle("");
                   setNewPostBody("");
@@ -2308,6 +2368,34 @@ export default function HomePage() {
           )}
           {activeTab === "lecture" && (
             <div className="space-y-4">
+              <div className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-ink-100 bg-white/70 px-4 py-3">
+                <div>
+                  <p className="text-sm font-semibold text-ink-700">Lecture uploads</p>
+                  <p className="text-xs text-ink-500">{lectureSummaryLabel}</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {lectureFilterActive && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedDate(null);
+                        setMobileLectureListOpen(false);
+                      }}
+                      className="rounded-full border border-ink-200 px-3 py-1 text-xs font-semibold text-ink-700 hover:border-ink-300"
+                    >
+                      Clear filter
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setIsLectureFilterOpen((prev) => !prev)}
+                    className="flex items-center gap-2 rounded-full border border-ink-200 px-3 py-1 text-xs font-semibold text-ink-700 hover:border-ink-300"
+                  >
+                    {isLectureFilterOpen ? "Hide calendar" : "Select date"}
+                  </button>
+                </div>
+              </div>
+              {isLectureFilterOpen && (
               <div className="glass-panel p-4">
                 <div className="flex items-center justify-between">
                   <button
@@ -2358,51 +2446,55 @@ export default function HomePage() {
                     );
                   })}
                 </div>
-                <p className="mt-3 text-xs text-ink-400">Select any day with a dot to read lecture uploads from classmates.</p>
+                <p className="mt-3 text-xs text-ink-400">
+                  Choose a highlighted day to filter lecture notes. Clear the filter to see everything.
+                </p>
               </div>
+              )}
 
               <div className="flex items-center justify-between rounded-2xl border border-ink-100 bg-white/70 px-4 py-2 lg:hidden">
                 <div>
                   <p className="text-sm font-semibold text-ink-700">
-                    {selectedDate ? format(selectedDate, "MMM d") : "Pick a day"}
+                    {selectedDate ? format(selectedDate, "MMM d") : "All lecture notes"}
                   </p>
                   <p className="text-xs text-ink-500">
-                    {postsForSelectedDay.length
-                      ? `${postsForSelectedDay.length} lecture note${postsForSelectedDay.length > 1 ? "s" : ""}`
-                      : "No notes for this date"}
+                    {selectedDate
+                      ? postsForFilterDate.length
+                        ? `${postsForFilterDate.length} upload${postsForFilterDate.length > 1 ? "s" : ""}`
+                        : "No notes for this date"
+                      : `${lectureCount} upload${lectureCount === 1 ? "" : "s"} total`}
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => postsForSelectedDay.length && setMobileLectureListOpen(true)}
+                  onClick={() => postsForFilterDate.length && setMobileLectureListOpen(true)}
                   className="flex items-center gap-2 rounded-full border border-ink-200 px-3 py-1 text-xs font-semibold text-ink-700 hover:border-ink-300 disabled:cursor-not-allowed disabled:text-ink-300"
-                  disabled={!postsForSelectedDay.length}
+                  disabled={!postsForFilterDate.length}
                 >
-                  <Menu className="h-4 w-4" />
-                  View list
+                  View day
                 </button>
               </div>
 
-              <div className="hidden space-y-4 lg:block">
-                {lectureCards.length ? (
-                  lectureCards
-                ) : (
-                  <div className="glass-panel border border-dashed border-ink-200 p-8 text-center text-sm text-ink-500">
-                    Pick a highlighted day in the calendar to unlock lecture uploads.
-                  </div>
-                )}
-              </div>
+              {lectureCards.length ? (
+                <div className="grid gap-4 lg:grid-cols-2">{lectureCards}</div>
+              ) : (
+                <div className="glass-panel border border-dashed border-ink-200 p-8 text-center text-sm text-ink-500">
+                  {lectureFilterActive
+                    ? "No lecture notes for this date yet. Try another day or clear the filter."
+                    : "No lecture notes yet. Be the first to drop a lecture upload."}
+                </div>
+              )}
             </div>
           )}
-          {mobileLectureListOpen && postsForSelectedDay.length > 0 && (
+          {mobileLectureListOpen && postsForFilterDate.length > 0 && (
             <div className="fixed inset-0 z-40 bg-black/60 p-4 lg:hidden">
-              <div className="mx-auto flex h-full max-w-xl flex-col rounded-3xl bg-white p-4">
-                <div className="mb-3 flex items-center justify-between">
+              <div className="mx-auto flex h-full max-w-md flex-col rounded-3xl bg-white p-6">
+                <div className="flex items-center justify-between border-b border-ink-100 pb-3">
                   <div>
-                    <p className="text-sm font-semibold text-ink-800">
+                    <p className="text-sm font-semibold text-ink-900">
                       {selectedDate ? format(selectedDate, "MMM d") : "Lecture notes"}
                     </p>
-                    <p className="text-xs text-ink-500">{postsForSelectedDay.length} uploads</p>
+                    <p className="text-xs text-ink-500">{postsForFilterDate.length} uploads</p>
                   </div>
                   <button
                     type="button"
@@ -2412,7 +2504,29 @@ export default function HomePage() {
                     <X className="h-4 w-4" />
                   </button>
                 </div>
-                <div className="flex-1 space-y-3 overflow-y-auto pb-2">{lectureCards}</div>
+                <div className="flex-1 space-y-3 overflow-y-auto pb-2">
+                  {postsForFilterDate.map((post) => (
+                    <article
+                      key={post.id}
+                      className="rounded-2xl border border-ink-100 p-4 text-sm text-ink-700"
+                      onClick={() => {
+                        if (!selectedDate) return;
+                        handleOpenThread({
+                          context: "lecture",
+                          postId: post.id,
+                          date: dayKey(selectedDate)
+                        });
+                        setMobileLectureListOpen(false);
+                      }}
+                    >
+                      <p className="text-xs uppercase tracking-wide text-ink-400">
+                        {selectedDate ? format(selectedDate, "MMM d") : ""}
+                      </p>
+                      <p className="mt-1 font-semibold">{post.title}</p>
+                      <p className="text-xs text-ink-500">{post.author}</p>
+                    </article>
+                  ))}
+                </div>
               </div>
             </div>
           )}
